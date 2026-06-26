@@ -36,7 +36,7 @@ def _get_supabase_cfg():
         # Fallback lokal — ganti nilai ini kalau mau test lokal
         return (
             "https://ccscayzxjmwzrxgdrqos.supabase.co",
-            "GANTI_DENGAN_ANON_KEY",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNjc2NheXp4am13enJ4Z2RycW9zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI0NjEyNDksImV4cCI6MjA5ODAzNzI0OX0.OQuopCqO28WcYFfbFvuVicj_OvHonduB_QRCrMZdnY",
             "dashboard-data",
         )
 
