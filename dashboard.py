@@ -33,15 +33,15 @@ def _get_supabase_cfg():
     try:
         return st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"], st.secrets["SUPABASE_BUCKET"]
     except Exception:
-        # Fallback lokal — ganti nilai ini kalau mau test lokal
         return (
             "https://ccscayzxjmwzrxgdrqos.supabase.co",
             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNjc2NheXp4am13enJ4Z2RycW9zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI0NjEyNDksImV4cCI6MjA5ODAzNzI0OX0.OQuopCqO28WcYFfbFvuVicj_OvHonduB_QRCrMZdnY",
             "dashboard-data",
         )
 
+
 PAYMENT_SCHEDULE = {
-    "KSNI":  list(range(7)),   # setiap hari
+    "KSNI":  [0, 1, 2, 3, 4],  # Senin-Jumat
     "NSI":   [0],              # Senin
     "SIMBA": [1, 3],           # Selasa & Kamis
     "MEIJI": [3],              # Kamis
@@ -189,6 +189,7 @@ def _supabase_get(filename: str) -> bytes | None:
     """Download file dari Supabase Storage."""
     url, key, bucket = _get_supabase_cfg()
     try:
+        # Coba via authenticated endpoint dulu
         resp = requests.get(
             f"{url}/storage/v1/object/{bucket}/{filename}",
             headers={"Authorization": f"Bearer {key}"},
@@ -196,9 +197,18 @@ def _supabase_get(filename: str) -> bytes | None:
         )
         if resp.status_code == 200:
             return resp.content
+        # Kalau gagal, coba public endpoint
+        resp2 = requests.get(
+            f"{url}/storage/v1/object/public/{bucket}/{filename}",
+            timeout=30,
+        )
+        if resp2.status_code == 200:
+            return resp2.content
+        # Log detail error untuk debug
+        st.sidebar.error(f"Supabase error {resp.status_code}: {resp.text[:200]}")
         return None
     except Exception as e:
-        logging.error("Supabase download error: %s", e)
+        st.sidebar.error(f"Supabase exception: {e}")
         return None
 
 
@@ -317,38 +327,81 @@ def render_header(meta):
 #  KPI CARDS
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Mapping kategori → grup display
+KATEGORI_GRUP = {
+    "belum miro":  "Belum Miro",
+    "proses pa":   "Proses PA",
+    "siap buat pa":"Proses PA",
+    "siap bayar":  "Siap Bayar",
+    "lunas":       "Lunas",
+    "lunas ":      "Lunas",
+}
+
 def render_kpi(df):
     st.markdown('<div class="sec-title">Executive Summary</div>', unsafe_allow_html=True)
 
-    lunas      = df["_lunas"] if "_lunas" in df.columns else pd.Series(False, index=df.index)
-    siap       = df["_siap_bayar"] if "_siap_bayar" in df.columns else pd.Series(False, index=df.index)
-    nominal    = df["Nominal Invoice"] if "Nominal Invoice" in df.columns else pd.Series(0.0)
+    lunas   = df["_lunas"]      if "_lunas"      in df.columns else pd.Series(False, index=df.index)
+    siap    = df["_siap_bayar"] if "_siap_bayar" in df.columns else pd.Series(False, index=df.index)
+    nominal = df["Nominal Invoice"] if "Nominal Invoice" in df.columns else pd.Series(0.0, index=df.index)
 
     outstanding = float(nominal[~lunas].sum())
     rtp         = float(nominal[siap].sum())
     avg6        = _avg6(df)
-    forecast    = min(avg6, rtp) if avg6 > 0 else rtp
-    backlog     = max(rtp - forecast, 0)
 
-    # Baris 1
-    c1,c2,c3,c4 = st.columns(4)
-    _kpi(c1, "Total Outstanding",  fmt_rp(outstanding), "Invoice belum Lunas", hi=True)
-    _kpi(c2, "Siap Bayar",         fmt_rp(rtp),         "Menunggu pembayaran",  hi=True)
-    _kpi(c3, "Forecast Payment",   fmt_rp(forecast),    f"Avg 6 bln: {fmt_rp(avg6)}", hi=True)
-    _kpi(c4, "Backlog",            fmt_rp(backlog),     "Siap Bayar – Forecast")
-
-    st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
-
-    # Baris 2
-    c5,c6,c7,c8 = st.columns(4)
-    _kpi(c5, "Jumlah Invoice",  f"{len(df):,}", "Total baris")
-    _kpi(c6, "Jumlah Vendor",   f"{df['Vendor'].nunique() if 'Vendor' in df.columns else 0:,}", "Vendor aktif")
-    _kpi(c7, "Principal",       f"{df['Principal'].nunique() if 'Principal' in df.columns else 0:,}", "Principal aktif")
+    # ── Baris 1: KPI Utama ───────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    _kpi(c1, "Total Outstanding", fmt_rp(outstanding), "Invoice belum Lunas", hi=True)
+    _kpi(c2, "Siap Bayar",        fmt_rp(rtp),         "Menunggu pembayaran",  hi=True)
+    _kpi(c3, "Jumlah Invoice",    f"{len(df):,}",       "Total invoice")
     avg_aging = df["Aging (Hari)"].mean() if "Aging (Hari)" in df.columns else 0
-    _kpi(c8, "Rata-rata Aging", f"{avg_aging:.0f} hari", "Rata-rata hari outstanding")
+    _kpi(c4, "Rata-rata Aging",   f"{avg_aging:.0f} hari", "Rata-rata outstanding")
 
-    return {"outstanding": outstanding, "rtp": rtp, "forecast": forecast,
-            "backlog": backlog, "avg6": avg6}
+    st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
+
+    # ── Baris 2: Breakdown Kategori ──────────────────────────────────────────
+    st.markdown('<div style="font-size:.7rem;font-weight:600;color:#6C757D;'
+                'text-transform:uppercase;letter-spacing:.05em;margin-bottom:.4rem;">'
+                'Breakdown Kategori</div>', unsafe_allow_html=True)
+
+    # Hitung per grup
+    URUTAN = ["Belum Miro", "Proses PA", "Siap Bayar", "Lunas", "Case"]
+    hasil  = {g: {"nominal": 0.0, "count": 0} for g in URUTAN}
+
+    if "Kategori" in df.columns:
+        for _, row in df.iterrows():
+            kat  = str(row.get("Kategori", "")).strip().lower()
+            nom  = float(row.get("Nominal Invoice", 0) or 0)
+            grup = KATEGORI_GRUP.get(kat, "Case")
+            hasil[grup]["nominal"] += nom
+            hasil[grup]["count"]   += 1
+
+    cols = st.columns(5)
+    WARNA = {
+        "Belum Miro": "#2980B9",
+        "Proses PA":  "#F39C12",
+        "Siap Bayar": "#27AE60",
+        "Lunas":      "#6C757D",
+        "Case":       "#C0392B",
+    }
+    for col, grup in zip(cols, URUTAN):
+        d   = hasil[grup]
+        warna = WARNA[grup]
+        col.markdown(f"""
+        <div style="background:#fff;border:1px solid #DEE2E6;border-top:3px solid {warna};
+                    border-radius:6px;padding:.7rem .9rem;">
+            <div style="font-size:.68rem;font-weight:600;color:#6C757D;
+                        text-transform:uppercase;letter-spacing:.04em;margin-bottom:.3rem;">
+                {grup}
+            </div>
+            <div style="font-size:1.05rem;font-weight:700;color:{warna};">
+                {fmt_rp(d["nominal"])}
+            </div>
+            <div style="font-size:.72rem;color:#ADB5BD;margin-top:.15rem;">
+                {d["count"]:,} invoice
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    return {"outstanding": outstanding, "rtp": rtp, "forecast": 0, "backlog": 0, "avg6": avg6}
 
 def _kpi(col, label, value, sub, hi=False):
     cls = "kpi-card hi" if hi else "kpi-card"
@@ -538,7 +591,7 @@ def render_chart(fig, height=290, key=""):
 
 # Berapa kali principal bayar per minggu
 FREKUENSI_BAYAR = {
-    "KSNI":  7,   # setiap hari
+    "KSNI":  5,   # Senin-Jumat
     "NSI":   1,   # 1x seminggu (Senin)
     "SIMBA": 2,   # 2x seminggu (Selasa & Kamis)
     "MEIJI": 1,   # 1x seminggu (Kamis)
