@@ -100,7 +100,11 @@ KOLOM_DISPLAY = [
     "No Invoice", "Tgl Invoice", "Tgl Jatuh Tempo",
     "Area", "Channel", "Zona",
     "Nominal Invoice", "DPP", "PPN",
-    "Tgl Payment", "Nominal Bayar", "Sisa Tagihan",
+    "No BPPR", "No BASP",
+    "Tgl Miro", "No Miro",
+    "Tgl Payment", "Nominal Bayar", "No PA",
+    "Tgl Clearing", "No Clearing",
+    "Sisa Tagihan",
     "Status ACC", "Kategori", "Keterangan",
     "Aging (Hari)", "Aging Bucket",
     "Bulan", "Tahun",
@@ -263,9 +267,8 @@ def _clean(df):
     df = df[df["Nominal Invoice"] > 0]
     log.info("  Drop nominal=0: %d → %d", before, len(df))
 
-    before = len(df)
-    df = df.drop_duplicates(subset=["No Invoice", "Principal"], keep="last")
-    log.info("  Dedup: %d dihapus, sisa %d", before - len(df), len(df))
+    # Tidak ada dedup — semua baris ditampilkan apa adanya
+    log.info("  Baris setelah cleaning: %d", len(df))
 
     if "Tgl Invoice" in df.columns:
         df["Bulan"] = df["Tgl Invoice"].dt.month

@@ -718,7 +718,12 @@ def render_tabel(df):
     SHOW_COLS = [c for c in [
         "Principal", "Vendor", "PIC",
         "No Invoice", "Tgl Invoice", "Tgl Jatuh Tempo",
-        "Area", "Nominal Invoice", "Nominal Bayar", "Sisa Tagihan",
+        "Area", "Nominal Invoice", "DPP", "PPN",
+        "No BPPR", "No BASP",
+        "Tgl Miro", "No Miro",
+        "Nominal Bayar", "No PA",
+        "Tgl Clearing", "No Clearing",
+        "Sisa Tagihan",
         "Status ACC", "Kategori", "Keterangan",
         "Aging (Hari)", "Aging Bucket",
     ] if c in df.columns]
@@ -782,9 +787,16 @@ def render_download(df, kpis):
 
     # Siapkan data per laporan
     SHOW = [c for c in [
-        "Principal","Vendor","PIC","No Invoice","Tgl Invoice","Tgl Jatuh Tempo",
-        "Area","Nominal Invoice","Nominal Bayar","Sisa Tagihan",
-        "Status ACC","Kategori","Keterangan","Aging (Hari)","Aging Bucket",
+        "Principal","Vendor","PIC",
+        "No Invoice","Tgl Invoice","Tgl Jatuh Tempo",
+        "Area","Nominal Invoice","DPP","PPN",
+        "No BPPR","No BASP",
+        "Tgl Miro","No Miro",
+        "Nominal Bayar","No PA",
+        "Tgl Clearing","No Clearing",
+        "Sisa Tagihan",
+        "Status ACC","Kategori","Keterangan",
+        "Aging (Hari)","Aging Bucket",
     ] if c in df.columns]
     detail_df = df[SHOW].copy()
     for col in ["Tgl Invoice","Tgl Jatuh Tempo"]:
