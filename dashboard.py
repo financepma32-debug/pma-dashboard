@@ -753,7 +753,7 @@ def render_tabel(df):
 
     c1, _, c3 = st.columns([2, 3, 2])
     c1.caption(f"{total:,} invoice")
-    page = c3.number_input("", min_value=1, max_value=total_pages,
+    page = c3.number_input("Halaman", min_value=1, max_value=total_pages,
                            value=1, step=1, label_visibility="collapsed")
     c3.caption(f"Hal. {page}/{total_pages}")
 
@@ -1111,7 +1111,7 @@ def _page_retur():
     total_pages = max(1, (total-1)//PAGE+1)
     c1, _, c3 = st.columns([2,3,2])
     c1.caption(f"{total:,} retur")
-    page = c3.number_input("", min_value=1, max_value=total_pages,
+    page = c3.number_input("Halaman", min_value=1, max_value=total_pages,
                            value=1, step=1, label_visibility="collapsed", key="r_page")
     c3.caption(f"Hal. {page}/{total_pages}")
     start = (page-1)*PAGE
