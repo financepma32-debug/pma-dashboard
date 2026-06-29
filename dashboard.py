@@ -24,7 +24,8 @@ import streamlit as st
 
 DASHBOARD_DATA   = Path(__file__).parent / "data" / "Dashboard_Data.xlsx"
 LAST_UPDATE_FILE = Path(__file__).parent / "data" / "last_update.json"
-LOGO_PATH        = Path(r"D:\PROJECT FAD\MONITORING PRINSIPLE\LOGO.jpg")
+LOGO_PATH        = Path(__file__).parent / "LOGO.jpg"   # lokal
+LOGO_PATH_CLOUD  = Path("/mount/src/pma-dashboard/LOGO.jpg")  # Streamlit Cloud
 LOG_DIR          = Path(__file__).parent / "logs"
 
 # ── Supabase config (diisi otomatis dari st.secrets saat di cloud) ────────────
@@ -271,12 +272,17 @@ def load_data():
         return None
 
 def logo_html():
-    if LOGO_PATH.exists():
-        import base64
-        b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode()
-        ext = "jpeg" if LOGO_PATH.suffix.lower() in (".jpg",".jpeg") else LOGO_PATH.suffix.lstrip(".")
-        return f'<img src="data:image/{ext};base64,{b64}" alt="logo">'
+    # Coba beberapa lokasi: cloud path, lokal, fallback teks
+    for path in [LOGO_PATH_CLOUD, LOGO_PATH]:
+        if path.exists():
+            try:
+                b64 = base64.b64encode(path.read_bytes()).decode()
+                ext = "jpeg" if path.suffix.lower() in (".jpg",".jpeg") else path.suffix.lstrip(".")
+                return f'<img src="data:image/{ext};base64,{b64}" alt="logo">'
+            except Exception:
+                pass
     return '<span style="font-size:1.4rem;font-weight:800;color:#C0392B;">PMA</span>'
+
 
 def chart_cfg():
     return {"displayModeBar": False, "responsive": True}
@@ -914,12 +920,57 @@ def apply_filter(df, f):
 #  MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_retur():
+    """Load sheet Retur dari Dashboard_Data.xlsx via Supabase."""
+    data = _supabase_get("Dashboard_Data.xlsx")
+    if data is None:
+        if not DASHBOARD_DATA.exists():
+            return None, None
+        data = DASHBOARD_DATA.read_bytes()
+    try:
+        df_retur = pd.read_excel(io.BytesIO(data), sheet_name="Retur",
+                                 engine="openpyxl", dtype=str)
+        df_saran = pd.read_excel(io.BytesIO(data), sheet_name="Saran PA Retur",
+                                 engine="openpyxl", dtype=str)
+        # Numerik
+        for df in [df_retur, df_saran]:
+            for col in ["Nominal Retur","DPP","PPN","Sisa Tagihan",
+                        "Nilai Invoice PA","Sisa Setelah Dipotong"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        # Tanggal
+        for df in [df_retur, df_saran]:
+            for col in ["Tgl CN","Tgl Jatuh Tempo","Tgl Miro","Tgl Payment","Tgl Clearing"]:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+        # Flag
+        for df in [df_retur, df_saran]:
+            if "Kategori" in df.columns:
+                norm = df["Kategori"].astype(str).str.strip().str.lower()
+                df["_lunas"] = norm.isin({"lunas","lunas "})
+        return df_retur, df_saran
+    except Exception as e:
+        return None, None
+
+
 def main():
     meta = load_meta()
     render_header(meta)
 
     df_raw = load_data()
 
+    # Tab navigasi
+    tab1, tab2 = st.tabs(["📄 Outstanding Invoice", "🔄 Outstanding Retur"])
+
+    with tab1:
+        _page_invoice(df_raw)
+
+    with tab2:
+        _page_retur()
+
+
+def _page_invoice(df_raw):
     # Sidebar
     filters = render_sidebar(df_raw) if df_raw is not None else {}
 
@@ -959,6 +1010,180 @@ def main():
 
     # ── Download ─────────────────────────────────────────────────────────────
     render_download(df, kpis)
+
+
+def _page_retur():
+    st.markdown('<div class="sec-title">Outstanding Retur Pembelian</div>',
+                unsafe_allow_html=True)
+
+    df_retur, df_saran = load_retur()
+
+    if df_retur is None or df_retur.empty:
+        st.info("Data retur belum tersedia. Jalankan update.exe terlebih dahulu.")
+        return
+
+    # ── KPI retur ────────────────────────────────────────────────────────────
+    lunas_mask = df_retur.get("_lunas", pd.Series(False, index=df_retur.index))
+    belum_lunas = df_retur[~lunas_mask]
+
+    c1, c2, c3, c4 = st.columns(4)
+    _kpi(c1, "Total Retur",
+         f"{len(df_retur):,}", "Semua transaksi retur")
+    _kpi(c2, "Belum Lunas",
+         f"{len(belum_lunas):,}", "Masih outstanding", hi=True)
+    nom_col = "Nominal Retur"
+    total_outstanding_retur = float(belum_lunas[nom_col].sum()) if nom_col in belum_lunas.columns else 0
+    _kpi(c3, "Nominal Outstanding",
+         fmt_rp(total_outstanding_retur), "Total nilai retur belum lunas", hi=True)
+    sisa_col = "Sisa Tagihan"
+    total_sisa = float(belum_lunas[sisa_col].sum()) if sisa_col in belum_lunas.columns else 0
+    _kpi(c4, "Sisa Tagihan",
+         fmt_rp(total_sisa), "Setelah pemotongan parsial")
+
+    st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+
+    # ── Filter sidebar retur ──────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("**Filter Retur**")
+        def opts_r(col):
+            if col not in df_retur.columns: return []
+            return sorted(df_retur[col].dropna().astype(str).unique().tolist())
+        f_principal = st.multiselect("Principal (Retur)", opts_r("Principal"), key="r_principal")
+        f_kategori  = st.multiselect("Kategori (Retur)",  opts_r("Kategori"),  key="r_kat")
+        f_area      = st.multiselect("Area (Retur)",      opts_r("Area"),      key="r_area")
+        show_lunas  = st.checkbox("Tampilkan yang Lunas", value=False, key="r_lunas")
+
+    # Apply filter
+    fdf = df_retur.copy()
+    if not show_lunas:
+        fdf = fdf[~fdf.get("_lunas", pd.Series(False, index=fdf.index))]
+    if f_principal: fdf = fdf[fdf["Principal"].isin(f_principal)]
+    if f_kategori and "Kategori" in fdf.columns:
+        fdf = fdf[fdf["Kategori"].isin(f_kategori)]
+    if f_area and "Area" in fdf.columns:
+        fdf = fdf[fdf["Area"].isin(f_area)]
+
+    # ── Breakdown kategori retur ──────────────────────────────────────────────
+    if "Kategori" in fdf.columns:
+        st.markdown('<div class="sec-title">Breakdown Kategori Retur</div>',
+                    unsafe_allow_html=True)
+        kat_dist = (fdf.groupby("Kategori")
+                    .agg(Count=("No Retur/CN","count"),
+                         Nominal=("Nominal Retur","sum"))
+                    .reset_index()
+                    .sort_values("Nominal", ascending=False))
+        cols = st.columns(min(len(kat_dist), 5))
+        for col, (_, row) in zip(cols, kat_dist.iterrows()):
+            col.markdown(f"""
+            <div style="background:#fff;border:1px solid #DEE2E6;border-top:3px solid #C0392B;
+                        border-radius:6px;padding:.7rem .9rem;">
+                <div style="font-size:.68rem;font-weight:600;color:#6C757D;
+                            text-transform:uppercase;letter-spacing:.04em;">{row['Kategori']}</div>
+                <div style="font-size:1.05rem;font-weight:700;color:#C0392B;">
+                    {fmt_rp(row['Nominal'])}</div>
+                <div style="font-size:.72rem;color:#ADB5BD;">{int(row['Count']):,} retur</div>
+            </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+
+    # ── Tabel retur ──────────────────────────────────────────────────────────
+    st.markdown('<div class="sec-title">Detail Retur</div>', unsafe_allow_html=True)
+
+    SHOW_RETUR = [c for c in [
+        "Principal", "Vendor", "PIC", "No Retur/CN", "Tgl CN", "Tgl Jatuh Tempo",
+        "Area", "Channel", "Nominal Retur", "Sisa Tagihan",
+        "No BASP", "No BPPR", "Tgl Miro", "No Miro",
+        "No PA", "Tgl Clearing", "No Clearing",
+        "Status ACC", "Kategori", "Keterangan",
+    ] if c in fdf.columns]
+
+    disp = fdf[SHOW_RETUR].copy()
+    for col in ["Tgl CN","Tgl Jatuh Tempo","Tgl Miro","Tgl Payment","Tgl Clearing"]:
+        if col in disp.columns:
+            disp[col] = pd.to_datetime(disp[col], errors="coerce").dt.strftime("%d-%m-%Y")
+    for col in ["Nominal Retur","Sisa Tagihan"]:
+        if col in disp.columns:
+            disp[col] = pd.to_numeric(disp[col], errors="coerce").apply(
+                lambda x: f"Rp {x:,.0f}" if pd.notna(x) and x > 0 else "—")
+
+    PAGE = 50
+    total = len(disp)
+    total_pages = max(1, (total-1)//PAGE+1)
+    c1, _, c3 = st.columns([2,3,2])
+    c1.caption(f"{total:,} retur")
+    page = c3.number_input("", min_value=1, max_value=total_pages,
+                           value=1, step=1, label_visibility="collapsed", key="r_page")
+    c3.caption(f"Hal. {page}/{total_pages}")
+    start = (page-1)*PAGE
+    st.dataframe(disp.iloc[start:start+PAGE], use_container_width=True, hide_index=True)
+
+    # ── Saran PA ─────────────────────────────────────────────────────────────
+    st.markdown('<div class="sec-title">Saran Matching PA untuk Retur Belum Lunas</div>',
+                unsafe_allow_html=True)
+    st.markdown("""
+    <div style="background:#EBF5FB;border-left:3px solid #2980B9;border-radius:0 4px 4px 0;
+                padding:.6rem .85rem;font-size:.79rem;color:#1A5276;margin-bottom:.75rem;">
+        Saran PA dipilih dari invoice outstanding principal yang sama dengan
+        <b>Nilai Invoice ≥ Nominal Retur</b>, diambil yang terkecil agar efisien.
+    </div>""", unsafe_allow_html=True)
+
+    if df_saran is not None and not df_saran.empty:
+        # Filter sesuai sidebar
+        fsaran = df_saran.copy()
+        if f_principal: fsaran = fsaran[fsaran["Principal"].isin(f_principal)]
+        if f_area and "Area" in fsaran.columns:
+            fsaran = fsaran[fsaran["Area"].isin(f_area)]
+
+        SHOW_SARAN = [c for c in [
+            "Principal","Vendor","No Retur/CN","Area","Nominal Retur",
+            "Sisa Tagihan","Kategori","Saran No PA","Nilai Invoice PA","Sisa Setelah Dipotong",
+        ] if c in fsaran.columns]
+        disp_s = fsaran[SHOW_SARAN].copy()
+        for col in ["Nominal Retur","Sisa Tagihan","Nilai Invoice PA","Sisa Setelah Dipotong"]:
+            if col in disp_s.columns:
+                disp_s[col] = pd.to_numeric(disp_s[col], errors="coerce").apply(
+                    lambda x: f"Rp {x:,.0f}" if pd.notna(x) and x > 0 else "—")
+        st.dataframe(disp_s, use_container_width=True, hide_index=True)
+    else:
+        st.info("Saran PA belum tersedia.")
+
+    # ── Download ─────────────────────────────────────────────────────────────
+    st.markdown('<div class="sec-title">Download</div>', unsafe_allow_html=True)
+    import io as _io
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    def _to_excel_retur(frames_sheets):
+        buf = _io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            for frame, name in frames_sheets:
+                frame.to_excel(w, sheet_name=name, index=False)
+                ws = w.sheets[name]
+                hf = Font(bold=True, color="FFFFFF", size=10)
+                hfill = PatternFill("solid", fgColor="C0392B")
+                for cell in ws[1]:
+                    cell.font, cell.fill = hf, hfill
+                    cell.alignment = Alignment(horizontal="center")
+                ws.freeze_panes = "A2"
+        buf.seek(0)
+        return buf.read()
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "📥 Detail Retur (.xlsx)",
+            _to_excel_retur([(fdf[[c for c in SHOW_RETUR if c in fdf.columns]], "Retur")]),
+            f"retur_detail_{ts}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
+    with c2:
+        if df_saran is not None and not df_saran.empty:
+            st.download_button(
+                "📥 Saran Matching PA (.xlsx)",
+                _to_excel_retur([(fsaran[[c for c in SHOW_SARAN if c in fsaran.columns]], "Saran PA")]),
+                f"saran_pa_retur_{ts}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,60 @@ SHEET_CONFIG = {
     "SIMBA": ("INVOICE SIMBA'26",     3),
 }
 
+# Sheet retur per principal (None = tidak ada)
+RETUR_SHEET_CONFIG = {
+    "KSNI":  ("RETUR",             3),
+    "NSI":   ("RETUR NSI 2026",    3),
+    "NNI":   ("GANTUNGAN - RETUR", 3),
+    "MEIJI": None,
+    "SIMBA": None,
+}
+
+# Map kolom retur -> nama internal
+RETUR_COL_MAP = {
+    "nama supplier/vendor":  "Vendor",
+    "tgl terima invoice":    "Tgl Terima",
+    "tgl terima cn":         "Tgl Terima",
+    "area":                  "Area",
+    "channel":               "Channel",
+    "gt/mt":                 "Channel",
+    "no. retur":             "No Retur/CN",
+    "no. cn":                "No Retur/CN",
+    "no. basp":              "No BASP",
+    "no. bppr":              "No BPPR",
+    "tanggal fisik":         "Tgl Fisik",
+    "tgl cn":                "Tgl CN",
+    "do retur":              "No DO Retur",
+    "no. do":                "No DO Retur",
+    "no.sj":                 "No SJ",
+    "no. sj":                "No SJ",
+    "reff.":                 "No Invoice Ref",
+    "total net":             "Nominal Retur",
+    "nominal cn":            "Nominal Retur",
+    "dpp":                   "DPP",
+    " ppn ":                 "PPN",
+    "ppn":                   "PPN",
+    "tgl miro":              "Tgl Miro",
+    "no. miro":              "No Miro",
+    "tgl. bayar":            "Tgl Payment",
+    "tgl bayar":             "Tgl Payment",
+    "no. pa":                "No PA",
+    "no payment advice":     "No PA",
+    "tgl/ clearing":         "Tgl Clearing",
+    "tgl clearing":          "Tgl Clearing",
+    "no clearing":           "No Clearing",
+    "sisa tagihan":          "Sisa Tagihan",
+    "keterangan":            "Keterangan",
+    "ket":                   "Keterangan",
+    "do invoice":            "No Invoice Ref DO",
+    "po":                    "PO",
+    "pic":                   "PIC",
+    "status acc":            "Status ACC",
+    "status":                "Status ACC",
+    "kategori":              "Kategori",
+    "tgl jatuh tempo":       "Tgl Jatuh Tempo",
+}
+
 LUNAS_VALUES   = {"lunas", "lunas "}
 SIAP_BAYAR_VAL = {"siap bayar"}
 
@@ -130,6 +184,134 @@ log = logging.getLogger(__name__)
 #  MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  BACA RETUR
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _baca_retur(files):
+    """Baca semua sheet retur dari file xlsb yang tersedia."""
+    frames = []
+    for path in files:
+        principal = None
+        for key in RETUR_SHEET_CONFIG:
+            if key.upper() in path.name.upper():
+                principal = key
+                break
+        if principal is None or RETUR_SHEET_CONFIG[principal] is None:
+            continue
+
+        sheet, hrow = RETUR_SHEET_CONFIG[principal]
+        try:
+            df = pd.read_excel(path, sheet_name=sheet, engine="pyxlsb",
+                               header=hrow, dtype=str)
+        except Exception as e:
+            log.warning("Gagal baca retur %s: %s", path.name, e)
+            continue
+
+        # Normalisasi kolom
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+        rename = {col: RETUR_COL_MAP[col.lower().strip()]
+                  for col in df.columns if col.lower().strip() in RETUR_COL_MAP}
+        df = df.rename(columns=rename)
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+        # Drop baris kosong
+        id_col = "No Retur/CN"
+        if id_col in df.columns:
+            df = df[df[id_col].notna()]
+            df = df[df[id_col].astype(str).str.strip().str.len() > 0]
+            df = df[~df[id_col].astype(str).str.upper().str.match(
+                r"^(TOTAL|SUBTOTAL|GRAND)", na=False)]
+
+        if df.empty:
+            continue
+
+        # Tanggal
+        for col in ["Tgl Terima", "Tgl CN", "Tgl Fisik", "Tgl Miro",
+                    "Tgl Payment", "Tgl Clearing", "Tgl Jatuh Tempo"]:
+            if col in df.columns:
+                df[col] = df[col].apply(_parse_tgl)
+
+        # Numerik
+        for col in ["Nominal Retur", "DPP", "PPN", "Sisa Tagihan"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        # Flag lunas
+        if "Kategori" in df.columns:
+            norm = df["Kategori"].astype(str).str.strip().str.lower()
+            df["_lunas"] = norm.isin(LUNAS_VALUES)
+        else:
+            df["_lunas"] = False
+
+        df["Principal"] = principal
+        frames.append(df)
+        log.info("  Retur %s: %d baris", principal, len(df))
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _saran_pa(df_retur, df_invoice):
+    """
+    Generate saran PA untuk retur yang belum lunas.
+    Logika: cari invoice outstanding principal sama dengan
+    Nominal Invoice >= Nominal Retur, pilih yang terkecil yang masih cukup.
+    """
+    if df_retur.empty or df_invoice.empty:
+        return df_retur.copy()
+
+    df_out = df_retur.copy()
+    df_out["Saran No PA"]          = ""
+    df_out["Nilai Invoice PA"]     = 0.0
+    df_out["Sisa Setelah Dipotong"] = 0.0
+
+    # Invoice outstanding per principal (bukan lunas, sudah ada No PA)
+    inv_outstanding = df_invoice[
+        ~df_invoice.get("_lunas", pd.Series(False, index=df_invoice.index)) &
+        df_invoice["No PA"].notna() &
+        (df_invoice["No PA"].astype(str).str.strip() != "") &
+        (~df_invoice["No PA"].astype(str).str.strip().isin(["-","nan","None"]))
+    ].copy() if "No PA" in df_invoice.columns else pd.DataFrame()
+
+    if inv_outstanding.empty:
+        return df_out
+
+    # Untuk setiap retur belum lunas, cari PA yang cocok
+    belum_lunas_mask = ~df_out["_lunas"]
+    for idx in df_out[belum_lunas_mask].index:
+        principal = df_out.at[idx, "Principal"]
+        nom_retur = float(df_out.at[idx, "Nominal Retur"] or 0)
+        if nom_retur <= 0:
+            continue
+
+        # Filter invoice principal sama
+        inv_p = inv_outstanding[inv_outstanding["Principal"] == principal].copy()
+        if inv_p.empty:
+            continue
+
+        # Cari invoice dengan nilai >= nominal retur, ambil yang terkecil
+        inv_p["Nominal Invoice"] = pd.to_numeric(
+            inv_p["Nominal Invoice"], errors="coerce").fillna(0)
+        kandidat = inv_p[inv_p["Nominal Invoice"] >= nom_retur].sort_values(
+            "Nominal Invoice")
+
+        if kandidat.empty:
+            # Kalau tidak ada yang cukup, ambil yang terbesar
+            kandidat = inv_p.sort_values("Nominal Invoice", ascending=False)
+
+        if not kandidat.empty:
+            best = kandidat.iloc[0]
+            df_out.at[idx, "Saran No PA"]           = str(best.get("No PA", ""))
+            df_out.at[idx, "Nilai Invoice PA"]       = float(best.get("Nominal Invoice", 0))
+            df_out.at[idx, "Sisa Setelah Dipotong"]  = float(
+                best.get("Nominal Invoice", 0)) - nom_retur
+
+    return df_out
+
+
 def main():
     _banner()
     log.info("=" * 60)
@@ -150,7 +332,17 @@ def main():
         df = _clean(df)
         df = _hitung_aging(df)
         df = _flag_status(df)
-        _simpan(df)
+
+        # Baca retur
+        log.info("Membaca data retur...")
+        df_retur = _baca_retur(files)
+        if not df_retur.empty:
+            df_retur = _saran_pa(df_retur, df)
+            log.info("Retur: %d baris (%d belum lunas)",
+                     len(df_retur),
+                     int((~df_retur["_lunas"]).sum()))
+
+        _simpan(df, df_retur)
         _simpan_meta(len(df))
         _sukses(len(df))
 
@@ -410,7 +602,7 @@ def _buat_bucket_jika_belum_ada():
         log.warning("Cek/buat bucket error: %s", e)
 
 
-def _simpan(df):
+def _simpan(df, df_retur=None):
     DASHBOARD_DATA.parent.mkdir(parents=True, exist_ok=True)
     log.info("Menyimpan %s ...", DASHBOARD_DATA)
 
@@ -458,11 +650,31 @@ def _simpan(df):
             )
             trend_df["Period"] = trend_df["Period"].astype(str)
 
+    # Siapkan sheet retur
+    retur_cols = [
+        "Principal", "Vendor", "PIC", "No Retur/CN", "Tgl CN", "Tgl Jatuh Tempo",
+        "Area", "Channel", "Nominal Retur", "DPP", "PPN",
+        "No BASP", "No BPPR", "Tgl Miro", "No Miro",
+        "Tgl Payment", "No PA", "Tgl Clearing", "No Clearing",
+        "Sisa Tagihan", "Status ACC", "Kategori", "Keterangan",
+    ]
+    retur_saran_cols = retur_cols + ["Saran No PA", "Nilai Invoice PA", "Sisa Setelah Dipotong"]
+
+    if df_retur is not None and not df_retur.empty:
+        retur_all   = df_retur[[c for c in retur_cols if c in df_retur.columns]].copy()
+        retur_belum = df_retur[~df_retur["_lunas"]].copy()
+        retur_saran = retur_belum[[c for c in retur_saran_cols if c in retur_belum.columns]]
+    else:
+        retur_all   = pd.DataFrame()
+        retur_saran = pd.DataFrame()
+
     with pd.ExcelWriter(DASHBOARD_DATA, engine="openpyxl") as writer:
-        df_out.to_excel(writer,  sheet_name="Invoice",             index=False)
-        kat_df.to_excel(writer,  sheet_name="Ringkasan Kategori",  index=False)
-        prin_df.to_excel(writer, sheet_name="Ringkasan Principal", index=False)
-        trend_df.to_excel(writer,sheet_name="Trend Pembayaran",    index=False)
+        df_out.to_excel(writer,     sheet_name="Invoice",             index=False)
+        kat_df.to_excel(writer,     sheet_name="Ringkasan Kategori",  index=False)
+        prin_df.to_excel(writer,    sheet_name="Ringkasan Principal", index=False)
+        trend_df.to_excel(writer,   sheet_name="Trend Pembayaran",    index=False)
+        retur_all.to_excel(writer,  sheet_name="Retur",               index=False)
+        retur_saran.to_excel(writer,sheet_name="Saran PA Retur",      index=False)
         _style_excel(writer)
 
     log.info("Tersimpan: %s (%.0f KB)", DASHBOARD_DATA,
